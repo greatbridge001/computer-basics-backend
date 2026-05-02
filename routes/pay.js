@@ -1,24 +1,26 @@
 // ===== PAYMENT ROUTES =====
 const express = require('express');
-const router  = express.Router();
-const axios   = require('axios');
-const store   = require('../data/store');
+const router = express.Router();
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+const store = require('../data/store');
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
+// Normalize phone number to 254XXXXXXXXX format
 function normalizePhone(phone) {
-  phone = (phone || '').replace(/[\s\-]/g, '');
-  if (phone.startsWith('0'))    return '254' + phone.slice(1);
+  phone = phone.replace(/\s/g, '');
+  if (phone.startsWith('0')) return '254' + phone.slice(1);
   if (phone.startsWith('+254')) return phone.slice(1);
-  if (phone.startsWith('254'))  return phone;
+  if (phone.startsWith('254')) return phone;
   return phone;
 }
 
+// Generate a short readable reference code
 function generateRef() {
   return 'SF-' + Math.random().toString(36).toUpperCase().slice(2, 8);
 }
 
-// ── POST /api/pay/initiate ────────────────────────────────────────────────────
+// ===== INITIATE PAYMENT =====
+// POST /api/pay/initiate
 router.post('/initiate', async (req, res) => {
   const { name, phone } = req.body;
 
@@ -27,167 +29,140 @@ router.post('/initiate', async (req, res) => {
   }
 
   const normalizedPhone = normalizePhone(phone);
-  const amount          = store.settings.price;
-  const reference       = generateRef();
+  const reference = generateRef();
+  const amount = store.settings.price;
 
-  // Already paid — send back existing reference so frontend can redirect immediately
+  // Check if already paid
   const existing = store.students.find(
     s => s.phone === normalizedPhone && s.status === 'paid'
   );
+
   if (existing) {
     return res.json({
       success: false,
-      alreadyEnrolled: true,
-      reference: existing.reference,
-      name: existing.name,
       message: 'This number already has an active enrollment.',
+      reference: existing.reference
     });
   }
 
-  // Create pending record
+  // Create pending student
   const student = {
     reference,
     name,
     phone: normalizedPhone,
     status: 'pending',
-    payheroRef: null,
-    createdAt: new Date().toISOString(),
+    createdAt: new Date().toISOString()
   };
+
   store.students.push(student);
 
-  const username    = process.env.PAYHERO_USERNAME;
-  const password    = process.env.PAYHERO_PASSWORD;
-  const channelId   = process.env.PAYHERO_CHANNEL_ID;
-  const callbackUrl = process.env.CALLBACK_URL ||
-    'https://smartfuture-backend.onrender.com/api/pay/callback';
+  const payheroUsername = process.env.PAYHERO_USERNAME;
+  const payheroPassword = process.env.PAYHERO_PASSWORD;
+  const channelId = process.env.PAYHERO_CHANNEL_ID;
 
-  // TEST MODE — no credentials set (local development)
-  if (!username || !password || !channelId) {
-    console.warn('⚠  PayHero credentials not set — TEST MODE: auto-approving in 4 s');
-    setTimeout(() => {
-      const s = store.students.find(st => st.reference === reference);
-      if (s) s.status = 'paid';
-    }, 4000);
-    return res.json({ success: true, reference, testMode: true });
-  }
+  const callbackUrl =
+    process.env.CALLBACK_URL ||
+    `https://digital-skills-backend.onrender.com/api/pay/callback`;
 
-  const credentials = Buffer.from(`${username}:${password}`).toString('base64');
+  const credentials = Buffer.from(`${payheroUsername}:${payheroPassword}`).toString('base64');
 
   try {
     const payheroRes = await axios.post(
       'https://backend.payhero.co.ke/api/v2/payments',
       {
-        amount,
-        phone_number:       normalizedPhone,
-        channel_id:         parseInt(channelId),
-        provider:           'm-pesa',
+        amount: amount,
+        phone_number: normalizedPhone,
+        channel_id: parseInt(channelId),
+        provider: 'm-pesa',
         external_reference: reference,
-        callback_url:       callbackUrl,
-        customer_name:      name,
+        callback_url: callbackUrl,
+        customer_name: name
       },
       {
         headers: {
-          Authorization:  `Basic ${credentials}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: 15000,
+          Authorization: `Basic ${credentials}`,
+          'Content-Type': 'application/json'
+        }
       }
     );
 
+    // Save transaction reference
     if (payheroRes.data && payheroRes.data.reference) {
-      student.payheroRef = payheroRes.data.reference;
+      store.transactions[reference] = payheroRes.data.reference;
     }
 
-    console.log(`✅ STK Push sent — ${reference} → ${normalizedPhone} KSh ${amount}`);
-    return res.json({ success: true, reference });
+    return res.json({
+      success: true,
+      reference,
+      message: 'M-Pesa STK Push sent. Check your phone.'
+    });
 
   } catch (error) {
     console.error('PayHero error:', error.response?.data || error.message);
 
-    // Remove pending record so student can retry
+    // Remove pending student
     const idx = store.students.findIndex(s => s.reference === reference);
     if (idx !== -1) store.students.splice(idx, 1);
 
     return res.json({
       success: false,
-      message:
-        error.response?.data?.message ||
-        'Failed to send M-Pesa request. Please check your phone number and try again.',
+      message: 'Failed to initiate payment.'
     });
   }
 });
 
-// ── GET /api/pay/status?reference=SF-XXXXXX ───────────────────────────────────
-// Frontend polls this every 4 seconds.
-// The moment status === "paid" the frontend stops polling and redirects
-// straight to dashboard.html — no manual step required.
+// ===== PAYMENT STATUS CHECK =====
+// GET /api/pay/status?reference=SF-XXXXXX
 router.get('/status', (req, res) => {
   const { reference } = req.query;
+
   if (!reference) return res.json({ status: 'not_found' });
 
   const student = store.students.find(s => s.reference === reference);
-  if (!student)   return res.json({ status: 'not_found' });
+
+  if (!student) return res.json({ status: 'not_found' });
 
   return res.json({
-    status:    student.status,   // 'pending' | 'paid' | 'failed'
-    reference: student.reference,
-    name:      student.name,
-    phone:     student.phone,
+    status: student.status,
+    name: student.name,
+    reference: student.reference
   });
 });
 
-// ── POST /api/pay/callback ────────────────────────────────────────────────────
-// PayHero hits this URL after the M-Pesa PIN is entered (success or failure).
-// We flip the student record to "paid" here.
-// The frontend poll sees the change on its very next tick (≤4 s) and
-// immediately does: window.location.href = 'dashboard.html?ref=SF-XXXXXX'
+// ===== PAYHERO CALLBACK =====
+// POST /api/pay/callback
 router.post('/callback', (req, res) => {
-  console.log('📩 PayHero callback body:', JSON.stringify(req.body, null, 2));
+  console.log('PayHero callback received:', JSON.stringify(req.body));
 
-  const body        = req.body || {};
-  const externalRef = body.external_reference
-    || body.ExternalReference
-    || body.reference
-    || body.Reference;
+  // 🔥 IMPORTANT: Respond immediately (prevents timeout)
+  res.status(200).json({ success: true });
 
-  const rawStatus = (body.status || body.Status || body.ResultCode || '').toString();
-  // PayHero uses "SUCCESS"; MPESA ResultCode 0 = success
-  const succeeded = ['SUCCESS', 'COMPLETED', '0', 0].includes(
-    isNaN(rawStatus) ? rawStatus.toUpperCase() : Number(rawStatus)
-  );
+  const data = req.body;
 
-  if (externalRef) {
-    const student = store.students.find(s => s.reference === externalRef);
-    if (student) {
-      student.status = succeeded ? 'paid' : 'failed';
-      student.paidAt = succeeded ? new Date().toISOString() : null;
-      console.log(`🔄 ${externalRef} status → ${student.status}`);
+  try {
+    if (data.status && data.response) {
+      const reference = data.response.ExternalReference;
+      const resultCode = data.response.ResultCode;
+
+      const student = store.students.find(s => s.reference === reference);
+
+      if (student) {
+        if (resultCode === 0) {
+          student.status = 'paid';
+        } else {
+          student.status = 'failed';
+        }
+
+        console.log(`✅ Payment ${reference} updated to ${student.status}`);
+      } else {
+        console.log('⚠️ Student not found for reference:', reference);
+      }
     } else {
-      console.warn(`⚠  Callback for unknown ref: ${externalRef}`);
+      console.log('⚠️ Invalid callback structure:', data);
     }
-  } else {
-    console.warn('⚠  Callback missing external_reference:', body);
+  } catch (err) {
+    console.error('Callback processing error:', err.message);
   }
-
-  // Always 200 — prevents PayHero from retrying
-  return res.status(200).json({ success: true });
-});
-
-// Some PayHero setups fire a GET callback
-router.get('/callback', (req, res) => {
-  const q          = req.query;
-  const extRef     = q.external_reference || q.reference;
-  const rawStatus  = (q.status || q.Status || '').toString().toUpperCase();
-  const succeeded  = ['SUCCESS', 'COMPLETED', '0'].includes(rawStatus);
-
-  if (extRef) {
-    const student = store.students.find(s => s.reference === extRef);
-    if (student) {
-      student.status = succeeded ? 'paid' : 'failed';
-      console.log(`🔄 GET callback: ${extRef} → ${student.status}`);
-    }
-  }
-  return res.status(200).json({ success: true });
 });
 
 module.exports = router;
